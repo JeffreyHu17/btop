@@ -16,23 +16,29 @@ indent = tab
 tab-size = 4
 */
 
+#include <algorithm>
+#include <charconv>
+#include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iterator>
+#include <numeric>
+#include <optional>
+#include <ranges>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
-#include <fstream>
-#include <ranges>
-#include <cmath>
-#include <unistd.h>
-#include <numeric>
-#include <sys/statvfs.h>
-#include <netdb.h>
+#include <utility>
+
+#include <arpa/inet.h> // for inet_ntop()
+#include <dlfcn.h>
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <arpa/inet.h> // for inet_ntop()
-#include <filesystem>
-#include <future>
-#include <dlfcn.h>
-#include <utility>
+#include <netdb.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 
 #if defined(RSMI_STATIC)
 	#include <rocm_smi/rocm_smi.h>
@@ -93,10 +99,10 @@ long long get_monotonicTimeUSec()
 namespace Cpu {
 	vector<long long> core_old_totals;
 	vector<long long> core_old_idles;
+	vector<fs::path> core_freq;
 	vector<string> available_fields = {"Auto", "total"};
 	vector<string> available_sensors = {"Auto"};
 	cpu_info current_cpu;
-	fs::path freq_path = "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq";
 	bool got_sensors{};
 	bool cpu_temp_only{};
 	bool supports_watts = true;
@@ -289,11 +295,18 @@ namespace Shared {
 		}
 
 		//? Init for namespace Cpu
-		if (not fs::exists(Cpu::freq_path) or access(Cpu::freq_path.c_str(), R_OK) == -1) Cpu::freq_path.clear();
 		Cpu::current_cpu.core_percent.insert(Cpu::current_cpu.core_percent.begin(), Shared::coreCount, {});
 		Cpu::current_cpu.temp.insert(Cpu::current_cpu.temp.begin(), Shared::coreCount + 1, {});
 		Cpu::core_old_totals.insert(Cpu::core_old_totals.begin(), Shared::coreCount, 0);
 		Cpu::core_old_idles.insert(Cpu::core_old_idles.begin(), Shared::coreCount, 0);
+
+		for (int i = 0; i < Shared::coreCount; ++i) {
+			Cpu::core_freq.push_back("/sys/devices/system/cpu/cpufreq/policy" + to_string(i) + "/scaling_cur_freq");
+			if (not fs::exists(Cpu::core_freq.back()) or access(Cpu::core_freq.back().c_str(), R_OK) == -1) {
+				Cpu::core_freq.pop_back();
+			}
+		}
+
 		Cpu::collect();
 		if (Runner::coreNum_reset) Runner::coreNum_reset = false;
 		for (auto& [field, vec] : Cpu::current_cpu.cpu_percent) {
@@ -306,11 +319,23 @@ namespace Shared {
 		}
 		Cpu::core_mapping = Cpu::get_core_mapping();
 
+		Cpu::container_engine = detect_container();
+
 		//? Init for namespace Gpu
 	#ifdef GPU_SUPPORT
-		Gpu::Nvml::init();
-		Gpu::Rsmi::init();
-		Gpu::Intel::init();
+		auto shown_gpus = Config::getS("shown_gpus");
+		if (s_contains(shown_gpus, "nvidia")) {
+		    Gpu::Nvml::init();
+		}
+
+		if (s_contains(shown_gpus, "amd")) {
+			Gpu::Rsmi::init();
+		}
+
+		if (s_contains(shown_gpus, "intel")) {
+			Gpu::Intel::init();
+		}
+
 		if (not Gpu::gpu_names.empty()) {
 			for (auto const& [key, _] : Gpu::gpus[0].gpu_percent)
 				Cpu::available_fields.push_back(key);
@@ -552,6 +577,26 @@ namespace Cpu {
 		}
 	}
 
+	static string normalize_frequency(double hz) {
+		string str;
+		if (hz > 999999) {
+			str = fmt::format("{:.1f}", hz / 1'000'000);
+			str.resize(3);
+			if (str.back() == '.') str.pop_back();
+			str += " THz";
+		}
+		else if (hz > 999) {
+			str = fmt::format("{:.1f}", hz / 1'000);
+			str.resize(3);
+			if (str.back() == '.') str.pop_back();
+			str += " GHz";
+		}
+		else {
+			str = fmt::format("{:.0f} MHz", hz);
+		}
+		return str;
+	}
+
 	string get_cpuHz() {
 		static int failed{};
 
@@ -559,20 +604,60 @@ namespace Cpu {
 			return ""s;
 
 		string cpuhz;
+
+		const auto &freq_mode = Config::getS("freq_mode");
+
 		try {
-			double hz{};
-			//? Try to get freq from /sys/devices/system/cpu/cpufreq/policy first (faster)
-			if (not freq_path.empty()) {
-				hz = stod(readfile(freq_path, "0.0")) / 1000;
-				if (hz <= 0.0 and ++failed >= 2)
-					freq_path.clear();
+			double hz = 0.0;
+			// Read frequencies from all CPU cores
+			vector<double> frequencies;
+			for (auto it = Cpu::core_freq.begin(); it != Cpu::core_freq.end(); ) {
+    			if (it->empty()) {
+        			it = Cpu::core_freq.erase(it);
+        			continue;
+    			}
+
+    			double core_hz = stod(readfile(*it, "0.0")) / 1000;
+    			if (core_hz <= 0.0 and ++failed >= 2) {
+        			it = Cpu::core_freq.erase(it);
+    			} else {
+        			frequencies.push_back(core_hz);
+        			if (freq_mode == "first") break;
+        			++it;
+    			}
+ 			}
+
+			if (not frequencies.empty()) {
+				if (freq_mode == "first") {
+					hz = frequencies.front();
+				}
+				if (freq_mode == "average") {
+					hz = std::accumulate(frequencies.begin(), frequencies.end(), 0.0) / static_cast<double>(frequencies.size());
+				}
+				else if (freq_mode == "highest") {
+					hz = *std::max_element(frequencies.begin(), frequencies.end());
+				}
+				else if (freq_mode == "lowest") {
+					hz = *std::min_element(frequencies.begin(), frequencies.end());
+				}
+				else if (freq_mode == "range") {
+					auto [min_hz,max_hz] = std::minmax_element(frequencies.begin(), frequencies.end());
+
+					// Format as range
+					string min_str, max_str;
+					min_str = normalize_frequency(*min_hz);
+					max_str = normalize_frequency(*max_hz);
+
+					return min_str + " - " + max_str;
+				}
 			}
 			//? If freq from /sys failed or is missing try to use /proc/cpuinfo
 			if (hz <= 0.0) {
 				ifstream cpufreq(Shared::procPath / "cpuinfo");
 				if (cpufreq.good()) {
 					while (cpufreq.ignore(SSmax, '\n')) {
-						if (cpufreq.peek() == 'c') {
+						// peek is caps sensitive so it was skipping 'CPU MHz'. This aims to fix it.
+						if (cpufreq.peek() == 'c' || cpufreq.peek() == 'C') {
 							cpufreq.ignore(SSmax, ' ');
 							if (cpufreq.peek() == 'M') {
 								cpufreq.ignore(SSmax, ':');
@@ -588,21 +673,7 @@ namespace Cpu {
 			if (hz <= 1 or hz >= 999999999)
 				throw std::runtime_error("Failed to read /sys/devices/system/cpu/cpufreq/policy and /proc/cpuinfo.");
 
-			if (hz > 999999) {
-				cpuhz = fmt::format("{:.1f}", hz / 1'000'000);
-				cpuhz.resize(3);
-				if (cpuhz.back() == '.') cpuhz.pop_back();
-				cpuhz += " THz";
-			}
-			else if (hz > 999) {
-				cpuhz = fmt::format("{:.1f}", hz / 1'000);
-				cpuhz.resize(3);
-				if (cpuhz.back() == '.') cpuhz.pop_back();
-				cpuhz += " GHz";
-			}
-			else {
-				cpuhz = fmt::format("{:.0f} MHz", hz);
-			}
+			cpuhz = normalize_frequency(hz);
 
 		}
 		catch (const std::exception& e) {
@@ -841,13 +912,13 @@ namespace Cpu {
 				catch (const std::invalid_argument&) { }
 				catch (const std::out_of_range&) { }
 			}
-		} 
+		}
 		//? Or get seconds to full
 		else if(is_in(status, "charging")) {
 			if (b.use_energy_or_charge ) {
 				if (not b.power_now.empty()) {
 					try {
-						seconds = (round(stod(readfile(b.energy_full , "0")) - round(stod(readfile(b.energy_now, "0"))))  
+						seconds = (round(stod(readfile(b.energy_full , "0")) - round(stod(readfile(b.energy_now, "0"))))
 									/ abs(stod(readfile(b.power_now, "1"))) * 3600);
 					}
 					catch (const std::invalid_argument&) { }
@@ -855,14 +926,14 @@ namespace Cpu {
 				}
 				else if (not b.current_now.empty()) {
 					try {
-						seconds = (round(stod(readfile(b.charge_full , "0")) - stod(readfile(b.charge_now, "0")))  
+						seconds = (round(stod(readfile(b.charge_full , "0")) - stod(readfile(b.charge_now, "0")))
 									/ std::abs(stod(readfile(b.current_now, "1"))) * 3600);
 					}
 					catch (const std::invalid_argument&) { }
 					catch (const std::out_of_range&) { }
 				}
 			}
-		} 
+		}
 
 		//? Get power draw
 		if (b.use_power) {
@@ -925,6 +996,51 @@ namespace Cpu {
 		previous_usage = current_usage;
 
 		return watts;
+	}
+
+	static auto to_int(std::string_view view) -> std::uint32_t {
+		std::uint32_t value {};
+		std::from_chars(view.data(), view.data() + view.size(), value);
+		return value;
+	}
+
+	static auto detect_active_cpus() -> std::vector<std::int32_t> {
+	    auto stream = std::ifstream { "/sys/fs/cgroup/cpuset.cpus.effective" };
+	    auto buf = std::string { std::istreambuf_iterator<char> { stream }, {} };
+
+	    if (buf.empty()) {
+	        auto result = std::vector<std::int32_t>(Shared::coreCount);
+	        std::iota(result.begin(), result.end(), Shared::coreCount);
+	        return result;
+	    }
+
+	    auto active_cpus = buf | std::views::split(',') | std::views::transform([](auto&& expr) {
+	                           // Officially only in C++23
+	                           // auto view = std::string_view { expr.begin(), expr.end() };
+	                           auto view =
+	                               std::string_view(&*expr.begin(), std::ranges::distance(expr.begin(), expr.end()));
+	                           auto dash = view.find('-');
+
+	                           if (dash == std::string_view::npos) {
+	                               // Single CPU, return iota of single element
+	                               auto value = to_int(view);
+	                               return std::views::iota(value, value + 1);
+	                           }
+
+	                           // Create views before and after '-'
+	                           auto low_view = view.substr(0, dash);
+	                           auto high_view = view.substr(dash + 1);
+
+	                           auto low = to_int(low_view);
+	                           auto high = to_int(high_view);
+	                           return std::views::iota(low, high + 1);
+	                       }) |
+	                       std::views::join;
+
+	    // Collect the view into a vector. C++20 way of `std::ranges::to`.
+	    auto result = std::vector<std::int32_t> {};
+	    std::ranges::copy(active_cpus, std::back_inserter(result));
+	    return result;
 	}
 
 	auto collect(bool no_update) -> cpu_info& {
@@ -1066,6 +1182,8 @@ namespace Cpu {
 
 		if (Config::getB("show_cpu_watts") and supports_watts)
 			current_cpu.usage_watts = get_cpuConsumptionWatts();
+
+		cpu.active_cpus = std::make_optional(detect_active_cpus());
 
 		return cpu;
 	}
@@ -2672,7 +2790,7 @@ namespace Proc {
 	fs::file_time_type passwd_time;
 
 	uint64_t cputimes;
-	int collapse = -1, expand = -1;
+	int collapse = -1, expand = -1, toggle_children = -1;
 	uint64_t old_cputimes{};
 	atomic<int> numpids{};
 	int filter_found{};
@@ -3084,6 +3202,23 @@ namespace Proc {
 		//* Generate tree view if enabled
 		if (tree and (not no_update or should_filter or sorted_change)) {
 			bool locate_selection = false;
+
+			if (toggle_children != -1) {
+				auto collapser = rng::find(current_procs, toggle_children, &proc_info::pid);
+				if (collapser != current_procs.end()){
+					for (auto& p : current_procs) {
+						if (p.ppid == collapser->pid) {
+							auto child = rng::find(current_procs, p.pid, &proc_info::pid);
+							if (child != current_procs.end()){
+								child->collapsed = not child->collapsed;
+							}
+						}
+					}
+					if (Config::ints.at("proc_selected") > 0) locate_selection = true;
+				}
+				toggle_children = -1;
+			}
+			
 			if (auto find_pid = (collapse != -1 ? collapse : expand); find_pid != -1) {
 				auto collapser = rng::find(current_procs, find_pid, &proc_info::pid);
 				if (collapser != current_procs.end()) {

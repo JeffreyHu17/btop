@@ -19,6 +19,7 @@ tab-size = 4
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iterator>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -542,7 +543,7 @@ namespace Cpu {
 		bool show_watts = (Config::getB("show_cpu_watts") and supports_watts);
 		auto single_graph = Config::getB("cpu_single_graph");
 		bool hide_cores = show_temps and (cpu_temp_only or not Config::getB("show_coretemp"));
-		const int extra_width = (hide_cores ? max(6, 6 * b_column_size) : 0);
+		const int extra_width = (hide_cores ? max(6, 6 * b_column_size) : (b_columns == 1 && !show_temps) ? 8 : 0);
 	#ifdef GPU_SUPPORT
 		const auto& show_gpu_info = Config::getS("show_gpu_info");
 		const bool gpu_always = show_gpu_info == "On";
@@ -600,6 +601,11 @@ namespace Cpu {
 			Input::mouse_mappings["-"] = {button_y, x + width - (int)update.size() - 7, 1, 2};
 			Input::mouse_mappings["+"] = {button_y, x + width - 5, 1, 2};
 
+			// Draw container engine name
+			if (Cpu::container_engine.has_value()) {
+				fmt::format_to(std::back_inserter(out), "{}{}{}{}{}", Mv::to(button_y, x + 28), title_left, Theme::c("title"), Cpu::container_engine.value(), title_right);
+			}
+
 			//? Graphs & meters
 			const int graph_default_width = x + width - b_width - 3;
 
@@ -656,6 +662,9 @@ namespace Cpu {
 				gpu_temp_graphs.resize(gpus.size());
 				gpu_mem_graphs.resize(gpus.size());
 				gpu_meters.resize(gpus.size());
+	
+				// Shrink gpu graph width in small boxes to prevent line width extending past box border
+				auto gpu_graph_width = b_width < 42 ? 4 : 5;
 
 				for (size_t i = 0; i < gpus.size(); i++) {
 					if (gpu_auto and v_contains(Gpu::shown_panels, i))
@@ -665,11 +674,11 @@ namespace Cpu {
 					//? GPU graphs/meters
 					auto width_left = b_width - 10 - (gpus.size() > 9 ? 2 : gpus.size() > 1 ? 1 : 0);
 					if (gpu.supported_functions.temp_info and show_temps) {
-						gpu_temp_graphs[i] = Draw::Graph{ 5, 1, "temp", gpu.temp, graph_symbol, false, false, gpu.temp_max, -23 };
+						gpu_temp_graphs[i] = Draw::Graph{ gpu_graph_width, 1, "temp", gpu.temp, graph_symbol, false, false, gpu.temp_max, -23 };
 						width_left -= 11;
 					}
 					if (gpu.supported_functions.mem_used and gpu.supported_functions.mem_total and b_columns > 1) {
-						gpu_mem_graphs[i] = Draw::Graph{ 5, 1, "used", safeVal(gpu.gpu_percent, "gpu-vram-totals"s), graph_symbol };
+						gpu_mem_graphs[i] = Draw::Graph{ gpu_graph_width, 1, "used", safeVal(gpu.gpu_percent, "gpu-vram-totals"s), graph_symbol };
 						width_left -= 5;
 					}
 					width_left -= (gpu.supported_functions.mem_used ? 5 : 0);
@@ -812,9 +821,16 @@ namespace Cpu {
 					+ Theme::c("graph_text") + "up" + Mv::r(1) + upstr;
 			}
 
+		#ifdef __linux__
+			const bool freq_range = Config::getS("freq_mode") == "range";
+		#else
+			const bool freq_range = false;
+		#endif
+
 			//? Cpu clock and cpu meter
 			if (Config::getB("show_cpu_freq") and not cpuHz.empty())
-				out += Mv::to(b_y, b_x + b_width - 10) + Fx::ub + Theme::c("div_line") + Symbols::h_line * (7 - cpuHz.size())
+				out += Mv::to(b_y, b_x + b_width - (freq_range ? 20 : 10)) + Fx::ub + Theme::c("div_line")
+					+ Symbols::h_line * ((freq_range ? 17 : 7) - cpuHz.size())
 					+ Symbols::title_left + Fx::b + Theme::c("title") + cpuHz + Fx::ub + Theme::c("div_line") + Symbols::title_right;
 
 		out += Mv::to(b_y + 1, b_x + 1) + Theme::c("main_fg") + Fx::b + "CPU " + cpu_meter(safeVal(cpu.cpu_percent, "total"s).back())
@@ -848,26 +864,31 @@ namespace Cpu {
 	#endif
 		max_row -= n_gpus_to_show;
 
+		auto is_cpu_enabled = [&cpu](const std::int32_t num) -> bool {
+			return !cpu.active_cpus.has_value() || std::ranges::find(cpu.active_cpus.value(), num) != cpu.active_cpus.value().end();
+		};
+
 		//? Core text and graphs
 		int cx = 0, cy = 1, cc = 0, core_width = (b_column_size == 0 ? 2 : 3);
 		if (Shared::coreCount >= 100) core_width++;
 		for (const auto& n : iota(0, Shared::coreCount)) {
-			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c("main_fg") + (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "")
+			auto enabled = is_cpu_enabled(n);
+			out += Mv::to(b_y + cy + 1, b_x + cx + 1) + Theme::c(enabled ? "main_fg" : "inactive_fg") + (Shared::coreCount < 100 ? Fx::b + 'C' + Fx::ub : "")
 				+ ljust(to_string(n), core_width);
 			if ((b_column_size > 0 or extra_width > 0) and cmp_less(n, core_graphs.size()))
 				out += Theme::c("inactive_fg") + graph_bg * (5 * b_column_size + extra_width) + Mv::l(5 * b_column_size + extra_width)
 					+ core_graphs.at(n)(safeVal(cpu.core_percent, n), data_same or redraw);
 
-			out += Theme::g("cpu").at(clamp(safeVal(cpu.core_percent, n).back(), 0ll, 100ll));
-			out += rjust(to_string(safeVal(cpu.core_percent, n).back()), (b_column_size < 2 ? 3 : 4)) + Theme::c("main_fg") + '%';
+			out += enabled ? Theme::g("cpu").at(clamp(safeVal(cpu.core_percent, n).back(), 0ll, 100ll)) : Theme::c("inactive_fg");
+			out += rjust(to_string(safeVal(cpu.core_percent, n).back()), (b_column_size < 2 ? 3 : 4)) + Theme::c(enabled ? "main_fg" : "inactive_fg") + '%';
 
 			if (show_temps and not hide_cores) {
 				const auto [temp, unit] = celsius_to(safeVal(cpu.temp, n+1).back(), temp_scale);
-				const auto temp_color = Theme::g("temp").at(clamp(safeVal(cpu.temp, n+1).back() * 100 / cpu.temp_max, 0ll, 100ll));
+				const auto temp_color = enabled ? Theme::g("temp").at(clamp(safeVal(cpu.temp, n+1).back() * 100 / cpu.temp_max, 0ll, 100ll)) : Theme::c("inactive_fg");
 				if (b_column_size > 1 and std::cmp_greater_equal(temp_graphs.size(), n))
 					out += ' ' + Theme::c("inactive_fg") + graph_bg * 5 + Mv::l(5)
 						+ temp_graphs.at(n+1)(safeVal(cpu.temp, n+1), data_same or redraw);
-				out += temp_color + rjust(to_string(temp), 4) + Theme::c("main_fg") + unit;
+				out += temp_color + rjust(to_string(temp), 4) + Theme::c(enabled ? "main_fg" : "inactive_fg") + unit;
 			}
 
 			out += Theme::c("div_line") + Symbols::v_line;
@@ -1662,11 +1683,14 @@ namespace Proc {
 				}
 				out += title_left + hi_color + Fx::b + (vim_keys ? 'K' : 'k') + t_color + "ill" + Fx::ub + title_right
 					+ title_left + hi_color + Fx::b + 's' + t_color + "ignals" + Fx::ub + title_right
+					+ title_left + hi_color + Fx::b + 'N' + t_color + "ice" + Fx::ub + title_right
 					+ Mv::to(d_y, d_x + d_width - 10) + title_left + t_color + Fx::b + hide + Symbols::enter + Fx::ub + title_right;
 				if (alive and selected == 0) {
 					Input::mouse_mappings["k"] = {d_y, mouse_x, 1, 4};
 					mouse_x += 6;
 					Input::mouse_mappings["s"] = {d_y, mouse_x, 1, 7};
+				    mouse_x += 9;
+					Input::mouse_mappings["N"] = {d_y, mouse_x, 1, 5};
 				}
 				if (selected == 0) Input::mouse_mappings["enter"] = {d_y, d_x + d_width - 9, 1, 6};
 
@@ -1760,6 +1784,9 @@ namespace Proc {
 			}
 			out += title_left_down + Fx::b + hi_color + 's' + t_color + "ignals" + Fx::ub + title_right_down;
 			if (selected > 0) Input::mouse_mappings["s"] = {y + height - 1, mouse_x, 1, 7};
+		    mouse_x += 9;
+		    out += title_left_down + Fx::b + hi_color + 'N' + t_color + "ice" + Fx::ub + title_right_down;
+		    if (selected > 0) Input::mouse_mappings["N"] = {y + height -1, mouse_x, 1, 5};
 
 			//? Labels for fields in list
 			if (not proc_tree)
@@ -1955,7 +1982,7 @@ namespace Proc {
 		}
 
 		out += Fx::reset;
-		while (lc++ < height - 5) out += Mv::to(y+lc+1, x+1) + string(width - 2, ' ');
+		while (lc++ < height - 3) out += Mv::to(y+lc+1, x+1) + string(width - 2, ' ');
 
 		//? Draw scrollbar if needed
 		if (numpids > select_max) {
@@ -2082,7 +2109,7 @@ namespace Draw {
 		#endif
 			if (b_columns * (21 + 12 * show_temp) < width - (width / 3)) {
 				b_column_size = 2;
-				b_width = (21 + 12 * show_temp) * b_columns - (b_columns - 1);
+				b_width =  max(29, (21 + 12 * show_temp) * b_columns - (b_columns - 1));
 			}
 			else if (b_columns * (15 + 6 * show_temp) < width - (width / 3)) {
 				b_column_size = 1;
@@ -2111,9 +2138,14 @@ namespace Draw {
 
 			auto& custom = Config::getS("custom_cpu_name");
 			static const bool hasCpuHz = not Cpu::get_cpuHz().empty();
+		#ifdef __linux__
+			static const bool freq_range = Config::getS("freq_mode") == "range";
+		#else
+			static const bool freq_range = false;
+		#endif
 			const string cpu_title = uresize(
 					(custom.empty() ? Cpu::cpuName : custom),
-					b_width - (Config::getB("show_cpu_freq") and hasCpuHz ? 14 : 4)
+					b_width - (Config::getB("show_cpu_freq") and hasCpuHz ? (freq_range ? 24 : 14) : 5)
 			);
 			box += createBox(b_x, b_y, b_width, b_height, "", false, cpu_title);
 		}

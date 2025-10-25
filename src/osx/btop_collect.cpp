@@ -49,6 +49,7 @@ tab-size = 4
 
 #include <cmath>
 #include <fstream>
+#include <mutex>
 #include <numeric>
 #include <ranges>
 #include <regex>
@@ -230,8 +231,9 @@ namespace Cpu {
 #endif
 				// try SMC (intel)
 				Logger::debug("checking intel");
-				SMCConnection smcCon;
 				try {
+					SMCConnection smcCon;
+					Logger::debug("SMC connection established");
 					long long t = smcCon.getTemp(-1);  // check if we have package T
 					if (t > -1) {
 						Logger::debug("intel sensors found");
@@ -249,7 +251,8 @@ namespace Cpu {
 						got_sensors = false;
 					}
 				} catch (std::runtime_error &e) {
-					// ignore, we don't have temp
+					Logger::debug("SMC not available: " + string(e.what()));
+					// ignore, we don't have temp (common in VMs)
 					got_sensors = false;
 				}
 #if __MAC_OS_X_VERSION_MIN_REQUIRED > 101504
@@ -521,6 +524,8 @@ namespace Mem {
 	fs::file_time_type fstab_time;
 	int disk_ios = 0;
 	vector<string> last_found;
+	static std::mutex iokit_mutex;  // Protect concurrent IOKit calls
+	static std::mutex interface_mutex;  // Protect concurrent interface access during USB device changes
 
 	mem_info current_mem{};
 
@@ -566,16 +571,14 @@ namespace Mem {
 	};
 
 	void collect_disk(std::unordered_map<string, disk_info> &disks, std::unordered_map<string, string> &mapping) {
+		// Lock mutex to prevent concurrent IOKit access
+		std::lock_guard<std::mutex> lock(iokit_mutex);
+
 		io_registry_entry_t drive;
 		io_iterator_t drive_list;
 
-		mach_port_t libtop_master_port;
-		if (IOMasterPort(bootstrap_port, &libtop_master_port)) {
-			Logger::error("error getting master port");
-			return;
-		}
 		/* Get the list of all drive objects. */
-		if (IOServiceGetMatchingServices(libtop_master_port,
+		if (IOServiceGetMatchingServices(kIOMainPortDefault,
 										 IOServiceMatching("IOMediaBSDClient"), &drive_list)) {
 			Logger::error("Error in IOServiceGetMatchingServices()");
 			return;
@@ -822,6 +825,8 @@ namespace Net {
 	};
 
 	auto collect(bool no_update) -> net_info & {
+		// Lock mutex to prevent concurrent interface access during USB device changes
+		std::lock_guard<std::mutex> lock(Mem::interface_mutex);
 		auto &net = current_net;
 		auto &config_iface = Config::getS("net_iface");
 		auto net_sync = Config::getB("net_sync");
@@ -1035,7 +1040,7 @@ namespace Proc {
 	fs::file_time_type passwd_time;
 
 	uint64_t cputimes;
-	int collapse = -1, expand = -1;
+	int collapse = -1, expand = -1, toggle_children = -1;
 	uint64_t old_cputimes = 0;
 	atomic<int> numpids = 0;
 	int filter_found = 0;
@@ -1300,6 +1305,23 @@ namespace Proc {
 		//* Generate tree view if enabled
 		if (tree and (not no_update or should_filter or sorted_change)) {
 			bool locate_selection = false;
+
+			if (toggle_children != -1) {
+				auto collapser = rng::find(current_procs, toggle_children, &proc_info::pid);
+				if (collapser != current_procs.end()){
+					for (auto& p : current_procs) {
+						if (p.ppid == collapser->pid) {
+							auto child = rng::find(current_procs, p.pid, &proc_info::pid);
+							if (child != current_procs.end()){
+								child->collapsed = not child->collapsed;
+							}
+						}
+					}
+					if (Config::ints.at("proc_selected") > 0) locate_selection = true;
+				}
+				toggle_children = -1;
+			}
+			
 			if (auto find_pid = (collapse != -1 ? collapse : expand); find_pid != -1) {
 				auto collapser = rng::find(current_procs, find_pid, &proc_info::pid);
 				if (collapser != current_procs.end()) {
